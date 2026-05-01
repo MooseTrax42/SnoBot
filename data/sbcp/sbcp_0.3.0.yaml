@@ -1,0 +1,885 @@
+# ============================================================================
+# SBCP - SnoBot Communication Protocol v0.3.0
+# ============================================================================
+# Organization:
+#   1. Protocol Overview - What this is and basic facts
+#   2. Quick Reference - Fast lookup for common operations
+#   3. Transport & Rules - How messages are sent
+#   4. Architecture - State machine and error handling
+#   5. Commands & Telemetry - The actual API
+#   6. Hardware & Physical - Robot specifications
+#   7. Implementation - How to build it
+#   8. Compliance & Safety - Legal and safety requirements
+# ============================================================================
+
+# ============================================================================
+# 1. PROTOCOL OVERVIEW
+# ============================================================================
+protocol:
+  name: SBCP
+  description: SnoBot Communication Protocol
+  version: 0.3.0
+  min_version: 0.3.0
+  max_version: 0.3.x
+
+  purpose: Serial communication protocol and system outline for wireless controller <-> Jetson Orin Nano <-> Arduino Uno R4 with event-driven commnd architecture. 
+
+  key_features:
+    - Sequence number tracking for reliability.
+    - Watchdog-protected system and commands.
+    - Fault detection and recovery.
+    - Safety-first design with E-stop priority.
+    - Comprehensive state machine design.
+    - Comprehensive error system.
+    - Event-driven command system.
+
+  message_format:
+    command:
+      fields: [cmd, args, seq]
+      max_size_bytes: 256
+      example: '{"cmd":"DRIVE","args":{"v":0.5,"w":0.0},"seq":42}'
+    response:
+      fields: [ok, error, data, seq, ts]
+      max_size_bytes: 128
+      example: '{"ok":true,"seq":42,"ts":12345}'
+    telemetry:
+      fields: [type, data, ts]
+      max_size_bytes: 256
+      example: '{"type":"STAT","v":0.5,"battery_v":46.2,"ts":12345}'
+
+  timestamps:
+    provided_by: arduino
+    unit: ms
+    monotonic: true
+    wraparound: 4294967295  # uint32_t max
+
+  notes:
+    - Multiple error codes may be active at the same time.
+    - High-severity errors dictate robot behavior.
+    - All floating-point values use 2-decimal precision.
+    - Jetson handles all intelligence.
+    - Arduino manages safety and command execution.
+
+# ============================================================================
+# 2. QUICK REFERENCE
+# ============================================================================
+quick_reference:
+  startup_sequence: HELLO -> IDLE -> MODE:MANUAL/AUTO -> SET_VELOCITY
+  motion_control: SET_VELOCITY (event-driven, latching)
+  communication_health: PING @ 10 Hz (minimum 2 Hz required)
+  emergency_stop: Physical E-stop button or STOP command.
+  status_monitoring: STAT telemetry @ 12 Hz automatic. 
+  
+  common_commands:
+  
+  error_codes:
+    # We good. 
+    0: OK - no errors detected.
+    
+    # Safety-critical (highest priority).
+    1: ESTOP - Emergency stop triggered.
+    2: SAFETY_INTERLOCK_OPEN - Machine access panel open.
+    3: UNINTENDED_MOVEMENT - Encoders detect significant motion while robot is not in a motion_enabled state.
+    4: TEMPERATURE_CRITICAL - Thermal shutdown threshold exceeded.
+    5: COLLISION_DETECTED - Impact detected via sensors or current spike.
+    6: MANUAL_OVERRIDE_ACTIVE - Human override engaged.
+    7: OBSTACLE_TOO_CLOSE - Obstacle violates minimum clearance.
+    8: WATCHDOG_RESET - System reset by watchdog.
+    9: BOOT_SELF_TEST_FAILED - One or more startup checks failed; system is not safe to operate.
+
+    # Info/clamps/limits (non-faults).
+    10: SET_VELOCITY_LIMIT - Movement command clamped.
+    11: ACCELERATION_LIMIT - Acceleration command clamped.
+    12: JERK_LIMIT - Jerk command clamped.
+    13: AUGER_LIMIT - Auger rpm clamped.
+    14: CHUTE_LIMIT - Chute rotation clamped.
+    15: THERMAL_THROTTLE - Motor or driver temperature exceeded warning threshold; maximum speed reduced.
+    16: CURRENT_LIMIT_ACTIVE - System current limiting active.
+    17: MOTOR_SATURATION - Motor command saturated at limit.
+    18: DIAGNOSTIC_MODE_ACTIVE - System operating in diagnostic mode.
+    19: TEST_MODE_ACTIVE - Non-operational test mode active.
+
+    # Mechanical and actuation faults.
+    20: AUGER_JAM - Mechanical jam detected in the auger stage.
+    21: WHEEL_JAM - Mechanical jam detected in the drive system.
+    22: CHUTE_JAM - Mechanical jam detected in the chute system.
+    23: SALT_JAM - Mechanical jam detected in the salt system.
+    24: AUGER_OVERCURRENT - Auger motor overcurrent.
+    25: WHEEL_OVERCURRENT - Drive motor(s) overcurrent.
+    26: SALT_PLATE_OVERCURRENT - Salt system overcurrent.
+    27: CHUTE_OVERCURRENT - Chute motor overcurrent.
+    28: MOTOR_STALL_DETECTED - Motor torque applied with no motion.
+    29: BACKDRIVE_DETECTED - External force driving motors.
+
+    # Motion control and dynamics.
+    30: CONTROL_LOOP_FAULT - Motor controller failed to maintain control.
+    31: INVALID_MOTION_PROFILE - Motion profile parameters invalid.
+    32: VELOCITY_DIRECTION_MISMATCH - Commanded direction inconsistent with sign conventions.
+    33: ZERO_VELOCITY_TIMEOUT - Motion enabled but zero velocity commanded for too long.
+    34: MOTION_DISABLED - Motion command received while motion is disabled.
+    35: MOVEMENT_WATCHDOG_TIMEOUT - No movement recognition within given threshold.
+    36: PATH_CONSTRAINT_VIOLATION - Estimated pose violates known map constraints.
+    37: PATH_INVALID - Planned path invalid or infeasible.
+    38: PATH_BLOCKED - Path obstructed during execution.
+    39: GOAL_UNREACHABLE - Target goal unreachable.
+
+    # Sensors and estimation.
+    40: SENSOR_TIMEOUT - A critical sensor has stopped sending data.
+    41: SENSOR_OUT_OF_RANGE - Sensor data is outside of threshold.
+    42: RESERVED - (Easter egg)
+    43: SENSOR_STALE - Sensor connected but not updating meaningfully.
+    44: SENSOR_DATA_INCONSISTENT - Conflicting sensor measurements detected.
+    45: IMU_FAILURE - IMU data invalid or inconsistent.
+    46: IMU_SATURATION - IMU measurement exceeds valid range.
+    47: IMU_TILT_LIMIT_STATIC - Robot tilted past a threshold.
+    48: IMU_TILT_LIMIT_DYNAMIC - Sudden spike in IMU data detected.
+    49: ENCODER_FAILURE - Encoder stopped or reporting invalid data.
+
+    # Localization and autonomy state.
+    50: LOCALIZATION_LOST - Robot can no longer determine its position within operating bounds.
+    51: LOCALIZATION_JUMP - Sudden discontinuity in pose estimate.
+    52: ODOMETRY_DRIFT - Large discrepancy detected between drive encoders.
+    53: ODOMETRY_INCOHERENT - Encoders differ by more than a threshold during straight movement.
+    54: TRAPPED - Robot cannot identify a path forward despite escape maneuvers.
+    55: COSTMAP_STALE - Environmental map outdated.
+    56: RECOVERY_FAILED - All recovery behaviors exhausted.
+    57: VISIBILITY_DEGRADED - Sensor visibility impaired.
+    58: MAP_CONSTRAINT_VIOLATION - Estimated pose violates known map constraints.
+    59: ICE_BUILDUP_DETECTED - Ice accumulation affecting motors.
+
+    # Power and electrical.
+    60: BATTERY_LOW - Battery level is low, proceed with caution.
+    61: BATTERY_CRITICAL - Battery level is too low to continue.
+    62: VOLTAGE_SAG - Detected during motor spin-up; battery unable to deliver required current.
+    63: OVERVOLTAGE_REGEN - Regenerative voltage exceeds battery range.
+    64: COLD_BATTERY_LIMIT - Battery temperature too cold to run without degradation.
+    65: POWER_RAIL_FAULT - Internal voltage rail out of range.
+    66: MOTOR_TEMP_SENSOR_FAILURE - Motor temperature sensor invalid.
+    67: DRIVER_TEMP_SENSOR_FAILURE - Motor driver temperature sensor invalid.
+    68: TEMP_SENSOR_CONFLICT - Conflicting temperature readings detected.
+    69: WATER_INGRESS_DETECTED - Moisture detected inside enclosure.
+
+    # Communication and protocol.
+    70: COMMUNICATION_WATCHDOG_TIMEOUT - No communication within given threshold.
+    71: COMM_LATENCY_HIGH - Round-trip communication latency exceeds threshold.
+    72: PACKET_CRC_FAILURE - Packet checksum failed validation.
+    73: PACKET_FORMAT_ERROR - Packet structure invalid or unexpected field length.
+    74: PACKET_TRUNCATED - Packet ended prematurely.
+    75: PACKET_OVERFLOW - Incoming packet exceeds buffer capacity.
+    76: PACKET_RATE_EXCEEDED - Packet rate exceeds allowed threshold.
+    77: PROTOCOL_DESYNC - Receiver unable to reestablish packet framing.
+    78: RESYNC_IN_PROGRESS - Communication resynchronization active.
+    79: LOGGING_FAILURE - Persistent failure to write logs or telemetry storage unavailable.
+
+    # Commands, sequencing, and time.
+    80: INVALID_COMMAND - Invalid command detected.
+    81: COMMAND_REJECTED - Command rejected due to invalid state.
+    82: STALE_COMMAND - Command timestamp or sequence number too old.
+    83: COMMAND_QUEUE_OVERFLOW - Pending command queue exhausted.
+    84: SEQUENCE_REGRESSION - Sequence number moved backwards unexpectedly.
+    85: SEQUENCE_JUMP - Sequence number advanced beyond allowable window.
+    86: SEQUENCE_STALL - Sequence number not advancing over time.
+    87: TIMESTAMP_INVALID - Timestamp outside allowable bounds.
+    88: TIME_SYNC_LOST - Clock synchronization lost between systems.
+    89: INCOMPATIBLE_PROTOCOL_VERSION - Protocol version mismatch detected.
+
+    # Software, configuration, and syste integrity.
+    90: RESOURCE_EXHAUSTED - CPU, memory, or queue exhaustion detected.
+    91: TASK_DEADLOCK - Task deadlock detected.
+    92: STACK_OVERFLOW - Stack overflow detected.
+    93: HEAP_CORRUPTION - Heap corruption detected.
+    94: ASSERT_FAILURE - Internal assertion failed.
+    95: CONFIG_CRC_FAILURE - Stored configuration checksum invalid.
+    96: PARAMETER_OUT_OF_RANGE - Runtime parameter invalid.
+    97: PARAMETER_CONFLICT - Mutually exclusive parameters enabled.
+    98: FACTORY_RESET_REQUIRED - Configuration unrecoverable.
+    99: UNSUPPORTED_FEATURE - Command references unsupported feature.
+    100: VIBRATION_EXCESSIVE - Sustained vibration beyond safe limits.
+    101: PATH_INVALID_STATE - Planner entered invalid internal state.
+
+  critical_limits:
+    max_linear_velocity: 1.35 m/s
+    max_angular_velocity: 3.0 rad/s
+    command_watchdog_timeout: 500 ms
+    motion_watchdog_timeout: 2000 ms
+    command_rate_max: 25 Hz
+    telemetry_rate: 12 Hz
+    battery_critical: 42 V
+    battery_warning: 44 V
+    temperature_warning: 60.0 °C
+    temperature_critical: 75.0 °C
+  
+  # UPDATE
+  state_transitions:
+    BOOT → IDLE: Automatic after successful self-test.
+    BOOT → FAULT: If self-test fails.
+    IDLE → MANUAL: MODE:MANUAL command.
+    IDLE → AUTO: MODE:AUTO command.
+    MANUAL → IDLE: MODE:IDLE command.
+    MANUAL → AUTO: MODE:AUTO command.
+    MANUAL → STOPPED: STOP command or operator pause.
+    AUTO → IDLE: MODE:IDLE command.
+    AUTO → MANUAL: MODE:MANUAL command.
+    AUTO → STOPPED: STOP command or safety event.
+    STOPPED → MANUAL: RESUME in manual context.
+    STOPPED → AUTO: RESUME in auto context.
+    DEGRADED_COMM → MANUAL/AUTO: When communication recovers.
+    ANY → FAULT: On non-critical fault.
+    ANY → ESTOPPED: On E-stop trigger.
+    FAULT → IDLE: After RESET_FAULTS clears all faults.
+    ESTOPPED → IDLE: After physical E-stop release.
+
+# ============================================================================
+# 3. TRANSPORT & COMMUNICATION RULES
+# ============================================================================
+transport:
+  physical:
+    type: serial
+    baud: 115200
+    data_bits: 8
+    parity: none
+    stop_bits: 1
+    flow_control: none
+    line_ending: "\n"
+  
+  buffers:
+    arduino_tx: 256 bytes
+    arduino_rx: 256 bytes
+    jetson_rx: 512 bytes
+    overflow_behavior: discard_oldest
+  
+  timing:
+    jetson_read_timeout: 100 ms
+    command_ack_timeout: 250 ms
+    arduino_startup_delay: 1000 ms
+
+communication_rules:
+  rates:
+    command_rate_max: 25 Hz
+    telemetry_rate_max: 25 Hz
+    per_command_rate_enforced: true
+  
+  reliability:
+    command_ack_required: true
+    ack_timeout_ms: 250
+    duplicate_command_policy: idempotent
+    parse_fail_behavior: ignore
+    command_timeout_ms: 500
+  
+  sequence_numbers:
+    enabled: true
+    field: seq
+    range: [0, 65535]
+    wraparound: 65535
+    echo_in_response: true
+    usage:
+      - Jetson increments seq for each command.
+      - Arduino echoes seq in response.
+      - Mismatch indicates lost command.
+
+  watchdog:
+    two_tier_system: true
+  
+    motion_watchdog:
+      monitored_commands: [SET_VELOCITY]
+      timeout_ms: 2000
+      grace_period_on_boot_ms: 5000
+      timeout_action: Gradual stop over 500 ms
+      ramp_down_time_ms: 500
+      auto_clear: Next valid SET_VELOCITY
+      rationale: Motion state expected to be stable.
+
+    communication_watchdog:
+      monitored_commands: [ANY]
+      timeout_ms: 500
+      grace_period_on_boot_ms: 2000
+      timeout_action: Enter FAULT state.
+      auto_clear: false
+      requires_reset: true
+      rationale: Detect true communication failure.
+
+# ============================================================================
+# 4. ARCHITECTURE
+# ============================================================================
+safety_precedence:
+  hierarchy: [ESTOP, FAULT, MODE, COMMAND]
+  authority: arduino
+  rules:
+    - ESTOP blocks all motion immediately (hardware level).
+    - FAULT conditions must be cleared before motion
+    - MODE must enable motion for velocity commands.
+    - Commands obey rate limits and argument validation.
+
+state_machine:
+  overview: 8-state machine with clear safety transitions.
+  design_philosopy: Arduino tracks safety/motion states, Jetson tracks operational behaviors.
+
+  states:
+    BOOT:
+      desc: Power-on initialization.
+      duration: ~1000ms
+      entry_actions:
+        - Initialize hardware peripherals.
+        - Run hardware self-tests (sensors, motors, encoders).
+        - Verify firmware integrity.
+        - Check ESTOP state.
+        - Load calibration from storage data.
+      allowed_commands: none
+      motion_enabled: false
+      telemetry: 2 Hz (minimal)
+      exits_to:
+        - IDLE (if boot self-test passed)
+        - FAULT (if boot self-test failed)
+      notes:
+        - Calibration happens during BOOT.
+        - Cannot be exited via command.
+
+    IDLE:
+      desc: Safe state, motors off, awaiting mode selection.
+      allowed_commands: [HELLO, PING, STATUS, MODE, RESET_FAULTS, GET_CONFIG, SET_CONFIG]
+      motion_enabled: false
+      diagnostic_safe: true # Can run non-motion diagnostics.
+      telemetry_rate: 5 Hz
+      exits_to:
+        - MANUAL (via MODE:MANUAL)
+        - AUTO (via MODE:AUTO)
+        - FAULT (on fault detection)
+        - ESTOPPED (on E-stop)
+      notes:
+        - Default safe state.
+        - All faults must be cleared to exit IDLE.
+
+    MANUAL:
+      desc: Human-controlled operation.
+      entry_actions:
+        - Enable motor drivers
+        - Start watchdogs
+        - Increase telemetry rate
+      allowed_commands: [PING, STATUS, SET_VELOCITY, SET_AUGER, SET_SALT, SET_CHUTE, SET_LIGHT, STOP, MODE]
+      motion_enabled: true
+      telemetry_rate: 12 Hz
+      substates_jetson_only: [MAPPING, NORMAL]
+      exits_to:
+        - IDLE (via MODE:IDLE)
+        - AUTO (via MODE:AUTO)
+        - STOPPED (via STOP or safety pause)
+        - DEGRADED_COMM (on comm degradation)
+        - FAULT (on fault)
+        - ESTOPPED (on E-stop)
+
+    AUTO:
+      desc: Autonomous operation.
+      entry_actions:
+        - Enable motor drivers
+        - Start watchdogs
+        - Increase telemetry rate
+        - Enable autonomous safety checks
+      allowed_commands: [PING, STATUS, SET_VELOCITY, SET_AUGER, SET_SALT, SET_CHUTE, SET_LIGHT, STOP, MODE]
+      motion_enabled: true
+      telemetry_rate: 12 Hz
+      substates_jetson_only: [NORMAL, RECOVERY, TRAPPED]
+      exits_to:
+        - IDLE (via MODE:IDLE)
+        - MANUAL (via MODE:MANUAL)
+        - STOPPED (via STOP or safety pause)
+        - DEGRADED_COMM (on comm degradation)
+        - FAULT (on fault)
+        - ESTOPPED (on E-stop)
+
+    STOPPED:
+      desc: Motion halted but mode still active, can resume.
+      entry_actions:
+         - Ramp motors to zero.
+         - Hold current mode context.
+         - Continue telemetry.
+      allowed_commands: [PING, STATUS, RESUME, MODE, RESET_FAULTS]
+      motion_enabled: false
+      telemetry_rate: 5 Hz
+      exits_to:
+        - MANUAL (via RESUME if previous mode was MANUAL)
+        - AUTO (via RESUME if previous mode was AUTO)
+        - IDLE (via MODE:IDLE)
+        - DEGRADED_COMM (on comm degradation)
+        - FAULT (on fault)
+        - ESTOPPED (on E-stop)
+
+    DEGRADED_COMM:
+      desc: Communication degraded but still functional.
+      entry_conditions:
+        - COMM_LATENCY_HIGH for 3 seconds.
+        - Packet loss > 10% over 10 seconds.
+        - PING rate drops below 5 Hz
+      entry_actions:
+        - Reduce maximum speed to 50%.
+        - Increase safety margins.
+        - Reject non-essential commands.
+      allowed_commands: [PING, STATUS, SET_VELOCITY, STOP]
+      motion_enabled: true (limited)
+      telemetry_rate: 25 Hz (increased)
+      exits_to:
+        - MANUAL (if communicationr recovers and was in MANUAL)
+        - AUTO (if communication recovers and was in AUTO)
+        - STOPPED (operator requesst)
+        - FAULT (if degredation persists > 30 seconds)
+        - ESTOPPED (on E-stop)
+      notes:
+        - Graceful degredation.
+        - Automatically transitions back when healthy.
+
+    FAULT:
+      desc: Non-recoverable fault requiring operator intervention.
+      entry_actions:
+        - Stop all motion immediately.
+        - Disable motor drivers.
+        - Log fault details with context.
+        - Send FAULT telemetry.
+      allowed_commands: [PING, STATUS, RESET_FAULTS]
+      motion_enabled: false
+      telemetry_rate: 5 Hz
+      exits_to:
+        - IDLE (via RESET_FAULTS after all faults cleared)
+        - ESTOPPED (on E-stop)
+      clearable_faults:
+        - Jams (after physical inspection)
+        - Overcurrent (after cooldown)
+        - Timeouts (after reconnection)
+        - Low battery (after charging)
+      non_clearable_faults:
+        - ESTOP (requires physical reset)
+        - Critical hardware failures
+
+    ESTOPPED:
+      description: Emergency stop state, requires physical intervention.
+      entry_actions:
+        - Immediate motor power removal.
+        - Disable all actuators.
+        - Flashing light status.
+        - Send ESTOP telemetry continuously.
+      allowed_commands: [PING, STATUS]
+      motion_enabled: false
+      telemetry_rate: 5 Hz
+      latched: true
+      exit_condition: Physical E-stop button release.
+      exits_to:
+        - IDLE (after physical E-stop release)
+      notes:
+        - Cannot be cleared via software.
+        - Hardware-enforced safety state.
+        - All motion commands rejected.
+
+error_handling:
+  classification:
+    by_severity: [info, warning, fault, critical]
+    by_source: [salt, chute, drive, auger, sensor, power, comm, system]
+
+  severity_behavior:
+    info: Log only, continue operation.
+    warning: Log and notify, may clamp values.
+    fault: Enter FAULT state, require RESET_FAULTS.
+    critical: Enter ESTOPPED state, require physical reset.
+
+  error_responses:
+    codes_1_9: Enter ESTOPPED immediately.
+    codes_10_19: Log warning, clamp to limits, continue.
+    codes_20_29: Enter FAULT, attempt automatic recovery.
+    codes_30_39: Enter FAULT if persistent, warning if transient.
+    codes_40_49: Enter FAULT if critical sensor, warning otherwise.
+    codes_50_59: Jetson-level handling, may trigger FAULT.
+    codes_60_69: Enter FAULT or ESTOPPED based on severity.
+    codes_70_79: Enter DEGRADED_COMM or FAULT.
+    codes_80_101: Enter FAULT or log warning.
+
+  recovery_procedures:
+    JAM:
+      automatic:
+        - Stop affected motor
+        - Attempt reverse rotation (2s @ 50%)
+        - If cleared, resume
+        - If persists after 3 attempts, latch FAULT
+      operator:
+        - Inspect and clear obstruction
+        - Send RESET_FAULTS
+    
+    OVERCURRENT:
+      automatic:
+        - Disable motor instantly
+        - Cool-down period (30s)
+        - Monitor temperature
+        - Allow retry if safe
+      operator:
+        - Verify no binding
+        - Check connections
+        - Send RESET_FAULTS
+    
+    LOW_BATTERY:
+      automatic:
+        - Reduce speed at 44V
+        - Disable auger at 42V
+        - Prevent mode changes
+      operator:
+        - Return to charging
+        - Do not operate <44V
+    
+    TIMEOUT:
+      automatic:
+        - Execute gradual stop
+        - Remain in current mode
+        - Clear on next valid command
+      operator:
+        - Check Jetson health
+        - Resume sending commands
+
+# ============================================================================
+# 5. COMMANDS & TELEMETRY API
+# ============================================================================
+commands:
+  handshake:
+    HELLO:
+      desc: Protocol handshake and version negotiation
+      priority: critical
+      required_on_startup: true
+      args:
+        version: {type: string, required: true, desc: Client protocol version}
+      response:
+        name: string (robot name)
+        version: string (protocol version)
+        compatible: bool
+        min_version: string
+        max_version: string
+      example:
+        cmd: '{"cmd":"HELLO","args":{"version":"0.3.0"},"seq":1}'
+        response: '{"ok":true,"data":{"name":"SnoBot","version":"0.3.0","compatible":true,"min_version":"0.3.0","max_version":"0.3.9"},"seq":1,"ts":1025}'
+
+  system:
+    PING:
+      desc: Communication health check and keepalive
+      args: {}
+      rate_limit: 25 Hz
+      recommended_rate: 10 Hz
+      minimum_rate: 2 Hz
+      response:
+        uptime_ms: int
+        last_velocity_ms: int (ms since last SET_VELOCITY)
+      behavior:
+        - Resets communication watchdog
+        - Does NOT reset motion watchdog
+        - Returns minimal telemetry
+      example:
+        cmd: '{"cmd":"PING","seq":42}'
+        response: '{"ok":true,"data":{"uptime_ms":123456,"last_velocity_ms":450},"seq":42,"ts":123456}'
+
+    STATUS:
+      desc: Request immediate full status
+      args: {}
+      response: Triggers immediate STAT telemetry
+      example:
+        cmd: '{"cmd":"STATUS","seq":10}'
+        response: '{"ok":true,"seq":10,"ts":8234}'
+
+  control:
+    MODE:
+      desc: Set robot operating mode
+      args:
+        mode: {type: enum, values: [IDLE, MANUAL, AUTO], required: true}
+      allowed_from_states: [IDLE, MANUAL, AUTO, STOPPED]
+      transitions:
+        IDLE→MANUAL: Enable motors, start watchdogs
+        IDLE→AUTO: Enable motors, autonomous checks active
+        MANUAL→AUTO: Switch to autonomous
+        AUTO→MANUAL: Switch to manual
+        ANY→IDLE: Disable motors, safe state
+      errors: [INVALID_COMMAND, COMMAND_REJECTED, FAULT]
+      example:
+        cmd: '{"cmd":"MODE","args":{"mode":"MANUAL"},"seq":3}'
+        response: '{"ok":true,"seq":3,"ts":741}'
+
+    SET_VELOCITY:
+      desc: Set and latch target velocity (event-driven, replaces DRIVE)
+      rate_limit: 25 Hz (max, not required)
+      watchdog_monitored: true (motion watchdog)
+      coordinate_frame:
+        origin: robot_center
+        x_axis: forward
+        rotation: counterclockwise_positive
+      args:
+        v: {type: float, units: m/s, range: [-1.35, 1.35], required: true, desc: Linear velocity}
+        w: {type: float, units: rad/s, range: [-3.0, 3.0], required: true, desc: Angular velocity}
+      behavior:
+        latching: true (remains active until changed)
+        smoothing: 200ms ramp via Arduino
+        idempotent: Repeated identical commands ignored
+        acceleration_limit: 2.0 m/s²
+        jerk_limit: 5.0 m/s³
+        timeout: 2000ms (motion watchdog)
+        timeout_action: Gradual stop over 500ms
+      errors: [SET_VELOCITY_LIMIT, MOTION_DISABLED, ESTOP]
+      example:
+        cmd: '{"cmd":"SET_VELOCITY","args":{"v":0.5,"w":0.0},"seq":120}'
+        response: '{"ok":true,"seq":120,"ts":457}'
+        clamped: '{"ok":true,"error":10,"data":{"v_actual":1.35,"w_actual":0.0},"seq":121,"ts":497}'
+
+    STOP:
+      desc: Immediate graceful stop
+      priority: high
+      args: {}
+      behavior:
+        action: Smooth deceleration to zero
+        duration: 200ms
+        state_change: Current mode → STOPPED
+      example:
+        cmd: '{"cmd":"STOP","seq":999}'
+        response: '{"ok":true,"seq":999,"ts":8750}'
+
+    RESUME:
+      desc: Resume from STOPPED state
+      args: {}
+      allowed_from_states: [STOPPED]
+      behavior: Returns to previous mode (MANUAL or AUTO)
+      example:
+        cmd: '{"cmd":"RESUME","seq":1000}'
+        response: '{"ok":true,"seq":1000,"ts":9000}'
+
+  tools:
+    SET_AUGER:
+      desc: Control auger motor
+      args:
+        rpm: {type: int, range: [0, 4000], required: true, desc: RPM (0=OFF)}
+      behavior:
+        startup_ramp: 1000ms
+        shutdown_ramp: 500ms
+        jam_detection: current_based
+        jam_threshold: 30 A
+      errors: [AUGER_JAM, AUGER_OVERCURRENT, AUGER_LIMIT]
+      example:
+        cmd: '{"cmd":"SET_AUGER","args":{"rpm":2000},"seq":50}'
+        response: '{"ok":true,"seq":50,"ts":25000}'
+
+    SET_SALT:
+      desc: Salt hopper dispenser control
+      args:
+        state: {type: enum, values: [ON, OFF], required: true}
+      behavior:
+        dispense_rate: variable_with_plate
+        hopper_capacity: 10.0 kg
+        empty_detection: current_sensing
+        empty_threshold: 1.0 kg
+      requires: Auger must be running
+      errors: [JAM, EMPTY]
+      example:
+        cmd: '{"cmd":"SALT","args":{"state":"ON"},"seq":60}'
+        response: '{"ok":true,"seq":60,"ts":30000}'
+
+    SET_CHUTE:
+      desc: Control chute rotation
+      args:
+        angle_deg: {type: int, range: [-90, 90], required: true}
+      behavior:
+        rotation_speed: 30 deg/s
+        position_hold: Active
+      errors: [CHUTE_JAM, CHUTE_OVERCURRENT, CHUTE_LIMIT]
+      example:
+        cmd: '{"cmd":"SET_CHUTE","args":{"angle_deg":45},"seq":70}'
+        response: '{"ok":true,"seq":70,"ts":35000}'
+
+    SET_LIGHT:
+      desc: Control robot lights with state-aware patterns
+      args:
+        which: {type: enum, values: [HEAD, STATUS, ALL], required: true}
+        state: {type: enum, values: [ON, OFF, BLINK, AUTO], required: true}
+        blink_hz: {type: float, range: [0.5, 10.0], required_if: state=BLINK}
+        pattern: {type: enum, values: [SOLID, FLASH, PULSE, ERROR], required_if: state=AUTO}
+      behavior:
+        AUTO_mode:
+          - IDLE: Slow pulse (breathing)
+          - MANUAL: Solid on
+          - AUTO: Slow blink (1 Hz)
+          - STOPPED: Fast blink (3 Hz)
+          - FAULT: Fast flash (5 Hz)
+          - ESTOPPED: Rapid flash (10 Hz)
+        override: Manual control overrides AUTO until next state change
+      notes:
+        - HEAD: Forward-facing work lights
+        - STATUS: Rear indicator lights (recommended for AUTO mode)
+        - ALL: Control both simultaneously
+      errors: [INVALID_COMMAND]
+      example:
+        cmd: '{"cmd":"SET_LIGHT","args":{"which":"STATUS","state":"AUTO"},"seq":70}'
+        response: '{"ok":true,"seq":70,"ts":35000}'
+
+  maintenance:
+    RESET_FAULTS:
+      desc: Clear latched fault conditions
+      args:
+        codes: {type: array, items: int, required: false, desc: Specific fault codes (empty=all clearable)}
+      clearable: [20-69, 80-89, 90-101]
+      not_clearable: [1-9]
+      response:
+        cleared: array of int
+        remaining: array of int
+      example:
+        cmd: '{"cmd":"RESET_FAULTS","seq":80}'
+        response: '{"ok":true,"data":{"cleared":[20,24],"remaining":[]},"seq":80,"ts":40000}'
+
+  diagnostics:
+    overview:
+      philosophy: Minimal, essential field diagnostics only
+      mode_required: IDLE (for safety)
+      complex_diagnostics: Use external tools or factory testing
+
+    GET_CONFIG:
+      desc: Read configuration parameter
+      allowed_from_states: [IDLE, MANUAL, AUTO, STOPPED]
+      args:
+        param: {type: string, required: true}
+      supported_params:
+        # PID tuning
+        - PID_DRIVE_KP
+        - PID_DRIVE_KI
+        - PID_DRIVE_KD
+        - PID_AUGER_KP
+        - PID_AUGER_KI
+        - PID_AUGER_KD
+        # Fault thresholds
+        - JAM_THRESHOLD_A
+        - BATT_WARN_V
+        - BATT_CRIT_V
+        - TEMP_WARN_C
+        - TEMP_CRIT_C
+        # Motion limits
+        - MAX_LINEAR_VEL
+        - MAX_ANGULAR_VEL
+        - MAX_ACCEL
+        # Watchdog timings
+        - MOTION_WD_MS
+        - COMM_WD_MS
+      response:
+        param: string
+        value: varies
+        units: string
+        min: varies
+        max: varies
+      example:
+        cmd: '{"cmd":"GET_CONFIG","args":{"param":"PID_DRIVE_KP"},"seq":100}'
+        response: '{"ok":true,"data":{"param":"PID_DRIVE_KP","value":1.5,"units":"unitless","min":0.0,"max":10.0},"seq":100,"ts":50000}'
+
+    SET_CONFIG:
+      desc: Write configuration parameter
+      allowed_from_states: [IDLE]
+      args:
+        param: {type: string, required: true}
+        value: {type: varies, required: true}
+        persist: {type: bool, required: false, default: true, desc: Save to EEPROM}
+      behavior:
+        validation: Range and type checking enforced
+        persistence: Saved to EEPROM if persist=true
+        effective: Immediate after validation
+        revert_on_error: Previous value restored if validation fails
+      errors: [INVALID_COMMAND, COMMAND_REJECTED, PARAMETER_OUT_OF_RANGE, PARAMETER_CONFLICT]
+      response:
+        param: string
+        old_value: varies
+        new_value: varies
+        persisted: bool
+      example:
+        cmd: '{"cmd":"SET_CONFIG","args":{"param":"PID_DRIVE_KP","value":1.8,"persist":true},"seq":101}'
+        response: '{"ok":true,"data":{"param":"PID_DRIVE_KP","old_value":1.5,"new_value":1.8,"persisted":true},"seq":101,"ts":51000}'
+
+    CAL_ENCODERS:
+      desc: Zero encoder counters
+      allowed_from_states: [IDLE]
+      args: {}
+      procedure:
+        - Verify robot stationary (IMU check)
+        - Reset encoder counters to zero
+        - Monitor for drift over 5 seconds
+        - Fail if drift > 10 ticks
+      response:
+        zeroed: bool
+        drift_ticks: int
+        imu_stable: bool
+      errors: [UNINTENDED_MOVEMENT, IMU_FAILURE]
+      example:
+        cmd: '{"cmd":"CAL_ENCODERS","seq":102}'
+        response: '{"ok":true,"data":{"zeroed":true,"drift_ticks":2,"imu_stable":true},"seq":102,"ts":52000}'
+
+    CAL_IMU:
+      desc: Calibrate IMU gyro and accelerometer offsets
+      allowed_from_states: [IDLE]
+      args:
+        save: {type: bool, required: false, default: true, desc: Save calibration to EEPROM}
+      procedure:
+        - Verify robot level and stationary
+        - Collect 1000 samples over 10 seconds
+        - Calculate bias offsets
+        - Validate offsets within reasonable range
+        - Optionally store in EEPROM
+      duration: 10s
+      response:
+        calibrated: bool
+        gyro_bias: array[3]  # [x, y, z] in rad/s
+        accel_bias: array[3]  # [x, y, z] in m/s²
+        saved: bool
+      errors: [UNINTENDED_MOVEMENT, IMU_FAILURE, IMU_SATURATION]
+      example:
+        cmd: '{"cmd":"CAL_IMU","args":{"save":true},"seq":103}'
+        response: '{"ok":true,"data":{"calibrated":true,"gyro_bias":[0.01,-0.02,0.00],"accel_bias":[0.05,0.03,0.12],"saved":true},"seq":103,"ts":62000}'
+
+    SELF_TEST:
+      desc: Run comprehensive hardware self-test
+      allowed_from_states: [IDLE]
+      args:
+        component: {type: enum, values: [ALL, IMU, ENCODERS, MOTORS, BATTERY, TEMPERATURE], required: false, default: ALL}
+        verbose: {type: bool, required: false, default: false, desc: Include detailed results}
+      procedure:
+        ALL:
+          - Check IMU communication and data validity
+          - Verify encoder connectivity and response
+          - Check motor driver status (no motion)
+          - Validate battery voltage and temperature sensors
+          - Verify all readings within normal range
+        IMU:
+          - Read IMU registers
+          - Verify calibration loaded
+          - Check for saturation or errors
+        ENCODERS:
+          - Read encoder values
+          - Verify counts are stable (no phantom motion)
+        MOTORS:
+          - Check motor driver communication
+          - Verify not in fault state
+          - Read temperature sensors
+        BATTERY:
+          - Read battery voltage
+          - Verify within operating range
+          - Check charge state
+        TEMPERATURE:
+          - Read all temperature sensors
+          - Verify within normal range
+      duration: 2-5s depending on component
+      response:
+        component: string
+        passed: bool
+        results: object (structure varies by component)
+        errors_detected: array[int]  # Error codes if any
+      example:
+        cmd: '{"cmd":"SELF_TEST","args":{"component":"ALL","verbose":true},"seq":104}'
+        response: '{"ok":true,"data":{"component":"ALL","passed":true,"results":{"imu":"OK","encoders":"OK","motors":"OK","battery":"OK","temperature":"OK"},"errors_detected":[]},"seq":104,"ts":65000}'
+
+    FACTORY_RESET:
+      desc: Reset all configuration to factory defaults
+      allowed_from_states: [IDLE]
+      args:
+        confirm: {type: string, required: true, pattern: "RESET", desc: Must be exactly "RESET" to proceed}
+      behavior:
+        - Erase all EEPROM configuration
+        - Load factory default parameters
+        - Clear all calibration data
+        - Requires IMU and encoder recalibration afterward
+        - Robot will enter FAULT state after reset
+      response:
+        reset_complete: bool
+        recalibration_required: array[string]
+      errors: [INVALID_COMMAND, ASSERT_FAILURE]
+      example:
+        cmd: '{"cmd":"FACTORY_RESET","args":{"confirm":"RESET"},"seq":105}'
+        response: '{"ok":true,"data":{"reset_complete":true,"recalibration_required":["IMU","ENCODERS"]},"seq":105,"ts":66000}'

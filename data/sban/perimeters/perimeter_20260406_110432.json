@@ -1,0 +1,29 @@
+{
+  "version": "1.0",
+  "created_at": "2026-04-06T10:50:35.415655",
+  "sample_distance_m": 0.3,
+  "total_distance_m": 0.0,
+  "loop_closed": true,
+  "closure_error_m": 0.0,
+  "metadata": {
+    "robot_width_m": 0.61,
+    "odometry_source": "encoder+imu",
+    "recording_duration_s": 60.0,
+    "waypoint_count": 1,
+    "origin": {
+      "x": 0.0,
+      "y": 0.0,
+      "theta": 0.0
+    },
+    "odometry_reset": true
+  },
+  "waypoints": [
+    {
+      "x": 0.0,
+      "y": 0.0,
+      "heading": 0.0,
+      "distance": 0.0,
+      "timestamp": 1775486975.4236288
+    }
+  ]
+}

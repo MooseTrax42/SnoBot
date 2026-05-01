@@ -1,0 +1,1647 @@
+# ============================================================================
+# SBCP - SnoBot Communication Protocol v0.3.0
+# ============================================================================
+# Organization:
+#   1. Protocol Overview - What this is and basic facts
+#   2. Quick Reference - Fast lookup for common operations
+#   3. Transport & Rules - How messages are sent
+#   4. Architecture - State machine and error handling
+#   5. Commands & Telemetry - The actual API
+#   6. Hardware & Physical - Robot specifications
+#   7. Implementation - How to build it
+#   8. Compliance & Safety - Legal and safety requirements
+# ============================================================================
+
+# ============================================================================
+# 1. PROTOCOL OVERVIEW
+# ============================================================================
+protocol:
+  name: SBCP
+  description: SnoBot Communication Protocol
+  version: 0.3.0
+  min_version: 0.3.0
+  max_version: 0.3.x
+  
+  purpose: Serial communication protocol for Jetson Orin Nano ↔ Arduino Uno R4
+  
+  key_features:
+    - JSON-based message encoding
+    - Sequence number tracking for reliability
+    - Watchdog-protected motion commands
+    - Comprehensive state machine
+    - Fault detection and recovery
+    - Safety-first design with E-stop priority
+
+  message_format:
+    command:
+      fields: [cmd, args, seq]
+      max_size_bytes: 256
+      example: '{"cmd":"DRIVE","args":{"v":0.5,"w":0.0},"seq":42}'
+    response:
+      fields: [ok, error, data, seq, ts]
+      max_size_bytes: 128
+      example: '{"ok":true,"seq":42,"ts":12345}'
+    telemetry:
+      fields: [type, data, ts]
+      max_size_bytes: 256
+      example: '{"type":"STAT","v":0.5,"battery_v":46.2,"ts":12345}'
+
+  timestamps:
+    provided_by: arduino
+    unit: ms
+    monotonic: true
+    wraparound: 4294967295  # uint32_t max
+
+# ============================================================================
+# 2. QUICK REFERENCE
+# ============================================================================
+quick_reference:
+  startup_sequence: HELLO → MODE:MANUAL → DRIVE
+  motion_control: DRIVE(v, w) @ 25Hz
+  emergency_stop: STOP or physical E-stop button
+  status_monitoring: STAT telemetry @ 12Hz
+  
+  common_commands:
+    start: '{"cmd":"MODE","args":{"mode":"MANUAL"},"seq":N}'
+    drive: '{"cmd":"DRIVE","args":{"v":0.5,"w":0.0},"seq":N}'
+    stop: '{"cmd":"STOP","seq":N}'
+    status: '{"cmd":"STATUS","seq":N}'
+  
+  error_codes:
+    0: OK - No error
+    1: LIMIT - Argument clamped (warning)
+    2: JAM - Mechanical jam (fault, latched)
+    3: OVERCURRENT - Motor overcurrent (fault, latched)
+    4: ESTOP - Emergency stop (critical, physical reset required)
+    5: TIMEOUT - Watchdog expired (fault, auto-clear)
+    6: INVALID - Invalid command (warning)
+    7: EMPTY - Salt hopper empty (warning)
+    8: LOW_BATTERY - Battery too low (fault, latched)
+    9: INCOMPATIBLE - Protocol version mismatch (critical)
+  
+  critical_limits:
+    max_linear_velocity: 1.35 m/s
+    max_angular_velocity: 3.0 rad/s
+    watchdog_timeout: 500 ms
+    command_rate_max: 25 Hz
+    telemetry_rate: 12 Hz
+    battery_critical: 40 V
+    battery_warning: 42 V
+    temperature_warning: 60 °C
+    temperature_critical: 75 °C
+  
+  state_transitions:
+    BOOT → DISABLED: Automatic after self-test
+    DISABLED → MANUAL: MODE:MANUAL command
+    MANUAL → AUTO: MODE:AUTO command
+    AUTO → MANUAL: MODE:MANUAL command
+    ANY → DISABLED: MODE:DISABLED command
+    FAULT → DISABLED: RESET_FAULTS, then MODE:DISABLED
+
+# ============================================================================
+# 3. TRANSPORT & COMMUNICATION RULES
+# ============================================================================
+transport:
+  physical:
+    type: serial
+    baud: 115200
+    data_bits: 8
+    parity: none
+    stop_bits: 1
+    flow_control: none
+    line_ending: "\n"
+  
+  buffers:
+    arduino_tx: 256 bytes
+    arduino_rx: 256 bytes
+    jetson_rx: 512 bytes
+    overflow_behavior: discard_oldest
+  
+  timing:
+    jetson_read_timeout: 100 ms
+    command_ack_timeout: 250 ms
+    arduino_startup_delay: 1000 ms
+
+communication_rules:
+  rates:
+    command_rate_max: 25 Hz
+    telemetry_rate_max: 25 Hz
+    per_command_rate_enforced: true
+  
+  reliability:
+    command_ack_required: true
+    ack_timeout_ms: 250
+    duplicate_command_policy: idempotent
+    parse_fail_behavior: ignore
+    command_timeout_ms: 500
+  
+  sequence_numbers:
+    enabled: true
+    field: seq
+    range: [0, 65535]
+    wraparound: 65535
+    echo_in_response: true
+    usage:
+      - Jetson increments seq for each command
+      - Arduino echoes seq in response
+      - Mismatch indicates lost command
+  
+  watchdog:
+    enabled: true
+    monitored_commands: [DRIVE]
+    timeout_ms: 500
+    grace_period_on_boot_ms: 2000
+    timeout_action: STOP
+    ramp_down_time_ms: 200
+    behavior:
+      - Watchdog starts on first DRIVE command
+      - Requires DRIVE command every 500 ms
+      - Smooth deceleration over 200 ms on timeout
+      - Auto-clears on next valid DRIVE command
+
+# ============================================================================
+# 4. ARCHITECTURE
+# ============================================================================
+safety_precedence:
+  hierarchy: [ESTOP, FAULT, MODE, COMMAND]
+  authority: arduino
+  rules:
+    - ESTOP blocks all motion commands immediately
+    - FAULT conditions must be cleared before motion
+    - MODE must be MANUAL or AUTO for DRIVE commands
+    - Commands obey rate limits and argument validation
+
+state_machine:
+  overview: Six-state machine with safety-first transitions
+  
+  states:
+    BOOT:
+      description: Power-on initialization
+      duration: ~1000 ms
+      entry_actions:
+        - Initialize hardware peripherals
+        - Self-test sensors (IMU, encoders, voltage)
+        - Check for existing fault conditions
+        - Load calibration from EEPROM
+      allowed_commands: none
+      motion_enabled: false
+      telemetry: disabled
+      exits_to:
+        - DISABLED (if self-test passed)
+        - FAULT_STATE (if self-test failed)
+
+    DISABLED:
+      description: Safe state, no motion possible
+      allowed_commands: [HELLO, PING, UPTIME, STATUS, MODE, RESET_FAULTS, LIGHT, POWER]
+      motion_enabled: false
+      telemetry_rate: 5 Hz
+      motors: OFF
+      exits_to:
+        - MANUAL (via MODE command)
+        - SERVICE (via MODE command)
+        - FAULT_STATE (on fault detection)
+
+    MANUAL:
+      description: Operator control via Jetson commands
+      allowed_commands: all_standard_commands
+      motion_enabled: true
+      telemetry_rate: 12 Hz
+      input_source: jetson_direct
+      watchdog: active
+      exits_to:
+        - DISABLED (via MODE command or fault)
+        - AUTO (via MODE command)
+        - FAULT_STATE (on fault detection)
+        - ESTOP_STATE (on E-stop trigger)
+
+    AUTO:
+      description: Autonomous navigation mode
+      allowed_commands: all_standard_commands
+      motion_enabled: true
+      telemetry_rate: 12 Hz
+      input_source: jetson_autonomous
+      additional_safety: path_validation
+      watchdog: active
+      exits_to:
+        - MANUAL (via MODE command)
+        - DISABLED (via MODE command or fault)
+        - FAULT_STATE (on fault detection)
+        - ESTOP_STATE (on E-stop trigger)
+
+    SERVICE:
+      description: Diagnostic and maintenance mode
+      allowed_commands: all_commands_plus_diagnostics
+      motion_enabled: true
+      telemetry_rate: 25 Hz
+      safety_overrides:
+        - Speed limit relaxed (+10%)
+        - Fault thresholds adjusted
+      entry_requirements:
+        - No active faults
+        - Operator confirmation
+      exits_to:
+        - DISABLED (via MODE command)
+        - FAULT_STATE (on critical fault only)
+
+    FAULT_STATE:
+      description: Non-critical fault condition
+      entry_actions:
+        - Stop all motion immediately
+        - Send FAULT telemetry
+        - Disable motor drivers
+        - Log fault details
+      allowed_commands: [PING, UPTIME, STATUS, RESET_FAULTS, MODE]
+      motion_enabled: false
+      telemetry_rate: 5 Hz
+      exit_condition: All faults cleared via RESET_FAULTS
+      exits_to:
+        - DISABLED (after successful fault clear)
+        - ESTOP_STATE (if E-stop triggered)
+
+    ESTOP_STATE:
+      description: Emergency stop - requires physical intervention
+      entry_actions:
+        - Emergency stop all motors (no ramp)
+        - Disable all power to actuators
+        - Send ESTOP telemetry immediately
+        - Set visual indicators (lights flashing)
+      allowed_commands: [PING, UPTIME, STATUS]
+      motion_enabled: false
+      telemetry_rate: 5 Hz
+      latched: true
+      exit_condition: Physical E-stop button released
+      exits_to:
+        - DISABLED (automatic after E-stop release)
+      notes:
+        - Cannot be cleared via software
+        - Requires physical reset of E-stop mechanism
+
+errors:
+  classification:
+    source: [DRIVE, AUGER, SALT, SYSTEM]
+    severity: [none, warning, fault, critical]
+  
+  severity_definitions:
+    none: No error, normal operation
+    warning: Non-blocking, informational only
+    fault: Blocks motion, software clearable
+    critical: Requires physical intervention
+  
+  error_catalog:
+    OK:
+      code: 0
+      severity: none
+      desc: No error
+      blocking: false
+      latched: false
+    
+    LIMIT:
+      code: 1
+      severity: warning
+      desc: Argument out of allowed range
+      blocking: false
+      latched: false
+      behavior: Command clamped to valid range, actual value returned in data field
+    
+    JAM:
+      code: 2
+      severity: fault
+      desc: Mechanical jam detected
+      blocking: true
+      latched: true
+      clearable_by: RESET_FAULTS
+      source: [AUGER, DRIVE, SALT]
+      detection: Current sensing or encoder stall
+    
+    OVERCURRENT:
+      code: 3
+      severity: fault
+      desc: Motor overcurrent detected
+      blocking: true
+      latched: true
+      clearable_by: RESET_FAULTS
+      source: [DRIVE, AUGER]
+      thresholds:
+        drive: 12.0 A
+        auger: 30.0 A
+    
+    ESTOP:
+      code: 4
+      severity: critical
+      desc: Emergency stop active
+      blocking: true
+      latched: true
+      clearable_by: physical_reset
+      notes:
+        - Requires physical E-stop button release
+        - All motion immediately halted
+        - Cannot be cleared via RESET_FAULTS
+    
+    TIMEOUT:
+      code: 5
+      severity: fault
+      desc: Command watchdog expired
+      blocking: true
+      latched: false
+      clearable_by: auto_clear
+      auto_clear_condition: Next valid DRIVE command
+    
+    INVALID:
+      code: 6
+      severity: warning
+      desc: Invalid command or arguments
+      blocking: false
+      latched: false
+    
+    EMPTY:
+      code: 7
+      severity: warning
+      desc: Salt hopper empty
+      blocking: false
+      latched: false
+      source: [SALT]
+    
+    LOW_BATTERY:
+      code: 8
+      severity: fault
+      desc: Battery voltage below threshold
+      blocking: true
+      latched: true
+      clearable_by: charging
+      thresholds:
+        critical: 40.0 V
+        warning: 42.0 V
+      notes:
+        - Motion disabled below 40V
+        - Warning issued at 42V
+    
+    INCOMPATIBLE:
+      code: 9
+      severity: critical
+      desc: Protocol version incompatible
+      blocking: true
+      latched: false
+      trigger: HELLO command with incompatible version
+      resolution: Update firmware or client software
+
+error_recovery:
+  JAM:
+    automatic_actions:
+      - Stop affected motor immediately
+      - Log jam event with timestamp and duration
+      - Attempt reverse rotation for 2s at 50% speed
+      - If cleared, resume normal operation
+      - If persists after 3 attempts, latch fault
+    operator_actions:
+      - Inspect mechanical path for obstructions
+      - Remove physical obstruction
+      - Verify free rotation manually
+      - Send RESET_FAULTS command
+    prevention:
+      - Regular mechanical inspection
+      - Keep salt dry to prevent clumping
+      - Monitor current trends for early detection
+
+  OVERCURRENT:
+    automatic_actions:
+      - Disable motor instantly (<50ms response)
+      - Enter cool-down period (30s minimum)
+      - Monitor temperature during cool-down
+      - Check if transient or persistent
+      - Allow retry after cool-down if temperature safe
+    operator_actions:
+      - Verify no mechanical binding
+      - Check motor and driver connections
+      - Inspect for short circuits
+      - Send RESET_FAULTS after verification
+    prevention:
+      - Monitor current trends
+      - Pre-emptive speed reduction at 90% threshold
+      - Regular motor maintenance
+
+  LOW_BATTERY:
+    automatic_actions:
+      - Reduce max speed to 50% at warning (42V)
+      - Disable auger at critical (40V)
+      - Send home/dock command if AUTO mode
+      - Prevent mode transitions to MANUAL/AUTO
+      - Increase telemetry rate to 25 Hz
+    operator_actions:
+      - Return robot to charging station
+      - Verify charging system operational
+      - Do not operate until >44V
+    prevention:
+      - Monitor battery voltage trends
+      - Establish conservative runtime limits
+      - Implement low-battery return-to-base
+
+  TIMEOUT:
+    automatic_actions:
+      - Execute smooth STOP (200ms ramp)
+      - Remain in current mode
+      - Continue telemetry transmission
+      - Clear fault on next valid DRIVE
+    operator_actions:
+      - Check Jetson communication health
+      - Verify network stability
+      - Resume sending DRIVE commands
+    prevention:
+      - Maintain 25 Hz DRIVE command rate
+      - Monitor round-trip latency
+      - Implement command buffering on Jetson
+
+  ESTOP:
+    automatic_actions:
+      - Immediate hard stop (no ramp)
+      - Disable all motor power
+      - Flash status lights
+      - Send ESTOP telemetry continuously
+      - Refuse all motion commands
+    operator_actions:
+      - Assess situation causing E-stop
+      - Clear hazard or issue
+      - Physically reset E-stop button
+      - Send MODE:DISABLED after reset
+      - Inspect robot before resuming
+    prevention:
+      - Proper operator training
+      - Clear working area
+      - Regular E-stop mechanism testing
+
+# ============================================================================
+# 5. COMMANDS & TELEMETRY API
+# ============================================================================
+commands:
+  handshake:
+    HELLO:
+      desc: Handshake and capability discovery
+      priority: critical
+      required_on_startup: true
+      args:
+        client_version: {type: string, required: true, desc: Protocol version of Jetson}
+      response:
+        name: string
+        version: string
+        caps: array
+        compatible: bool
+        min_version: string
+        max_version: string
+      example:
+        cmd: '{"cmd":"HELLO","args":{"client_version":"0.2.0"},"seq":1}'
+        response: '{"ok":true,"data":{"name":"SnoBot","version":"0.2.0","caps":["DRIVE","AUGER","SALT","IMU"],"compatible":true},"seq":1,"ts":1025}'
+
+  system:
+    PING:
+      desc: Connectivity and liveness check
+      args: {}
+      rate_limit: 10 Hz
+      response:
+        uptime_ms: int
+      example:
+        cmd: '{"cmd":"PING","seq":42}'
+        response: '{"ok":true,"data":{"uptime_ms":123456},"seq":42,"ts":123456}'
+
+    UPTIME:
+      desc: Query controller uptime
+      args: {}
+      response:
+        uptime_ms: int
+      note: Identical to PING, for semantic clarity
+
+    POWER:
+      desc: Power state control
+      args:
+        state: {type: enum, values: [ON, OFF, SLEEP], required: true}
+      behavior:
+        ON: Enable motor drivers and peripherals
+        OFF: Disable all motion and tools (safe state)
+        SLEEP: Low power mode, telemetry at 1 Hz
+      errors: [INVALID, FAULT]
+      example:
+        cmd: '{"cmd":"POWER","args":{"state":"ON"},"seq":5}'
+        response: '{"ok":true,"seq":5,"ts":5420}'
+
+    STATUS:
+      desc: Request immediate status telemetry
+      args: {}
+      response: Triggers immediate STAT telemetry
+      note: Does not affect periodic telemetry rate
+      example:
+        cmd: '{"cmd":"STATUS","seq":10}'
+        response: '{"ok":true,"seq":10,"ts":8234}'
+
+  control:
+    MODE:
+      desc: Set robot operating mode
+      args:
+        mode: {type: enum, values: [DISABLED, MANUAL, AUTO, SERVICE], required: true}
+      allowed_transitions:
+        - [DISABLED, MANUAL]
+        - [DISABLED, SERVICE]
+        - [MANUAL, DISABLED]
+        - [MANUAL, AUTO]
+        - [AUTO, MANUAL]
+        - [AUTO, DISABLED]
+        - [SERVICE, DISABLED]
+      errors: [INVALID, FAULT]
+      notes:
+        - Cannot transition directly DISABLED→AUTO
+        - SERVICE requires fault-free state
+        - Mode change clears motion latches
+      example:
+        cmd: '{"cmd":"MODE","args":{"mode":"MANUAL"},"seq":3}'
+        response: '{"ok":true,"seq":3,"ts":741}'
+
+    STOP:
+      desc: Immediately stop all motion
+      priority: high
+      args: {}
+      behavior:
+        action: Smooth deceleration to zero
+        duration: 200 ms
+        latched: true
+        clear_condition: Next DRIVE command
+      notes:
+        - Stops drive motors only
+        - Auger and salt unaffected
+        - Watchdog continues running
+      example:
+        cmd: '{"cmd":"STOP","seq":999}'
+        response: '{"ok":true,"seq":999,"ts":8750}'
+
+  motion:
+    DRIVE:
+      desc: Differential drive velocity command
+      rate: 25 Hz
+      watchdog_monitored: true
+      coordinate_frame:
+        origin: robot_center
+        x_axis: forward
+        rotation: counterclockwise_positive
+      args:
+        v: {type: float, units: m/s, range: [-1.35, 1.35], required: true, desc: Linear velocity (forward positive)}
+        w: {type: float, units: rad/s, range: [-3.0, 3.0], required: true, desc: Angular velocity (CCW positive)}
+      behavior:
+        smoothing: arduino
+        acceleration_limit: 2.0 m/s²
+        jerk_limit: 5.0 m/s³
+        timeout: 500 ms
+        timeout_action: STOP (200ms ramp)
+        clamping: Commands clamped to valid range
+      errors: [LIMIT, ESTOP, TIMEOUT, FAULT]
+      example:
+        cmd: '{"cmd":"DRIVE","args":{"v":0.5,"w":0.0},"seq":120}'
+        response: '{"ok":true,"seq":120,"ts":457}'
+        with_limit: '{"ok":true,"data":{"v_actual":1.35,"w_actual":0.0},"error":"LIMIT","seq":121,"ts":497}'
+
+  tools:
+    AUGER:
+      desc: Auger motor control
+      args:
+        rpm: {type: int, range: [0, 4000], required: true, desc: RPM (0=OFF)}
+      behavior:
+        startup_ramp: 500 ms
+        shutdown_ramp: 300 ms
+        jam_detection: current_based
+        jam_threshold: 30 A
+        jam_duration: 500 ms
+      errors: [JAM, OVERCURRENT, ESTOP, LIMIT]
+      example:
+        cmd: '{"cmd":"AUGER","args":{"rpm":2000},"seq":50}'
+        response: '{"ok":true,"seq":50,"ts":25000}'
+
+    SALT:
+      desc: Salt hopper dispenser control
+      args:
+        state: {type: enum, values: [ON, OFF], required: true}
+      behavior:
+        dispense_rate: variable_with_plate
+        hopper_capacity: 10.0 kg
+        empty_detection: current_sensing
+        empty_threshold: 1.0 kg
+      requires: Auger must be running
+      errors: [JAM, EMPTY]
+      example:
+        cmd: '{"cmd":"SALT","args":{"state":"ON"},"seq":60}'
+        response: '{"ok":true,"seq":60,"ts":30000}'
+
+    LIGHT:
+      desc: Control robot lights
+      args:
+        which: {type: enum, values: [HEAD, STATUS], required: true}
+        state: {type: enum, values: [ON, OFF, BLINK], required: true}
+        blink_hz: {type: float, range: [0.5, 10.0], required_if: state=BLINK}
+      notes:
+        - HEAD: Forward-facing work lights
+        - STATUS: Rear indicator lights
+      errors: [INVALID]
+      example:
+        cmd: '{"cmd":"LIGHT","args":{"which":"HEAD","state":"ON"},"seq":70}'
+        response: '{"ok":true,"seq":70,"ts":35000}'
+
+  maintenance:
+    RESET_FAULTS:
+      desc: Clear latched fault conditions
+      args:
+        specified: {type: array, items: string, required: false, desc: Specific faults to clear (empty=all)}
+      clearable: [JAM, OVERCURRENT, TIMEOUT, LOW_BATTERY]
+      not_clearable: [ESTOP]
+      errors: [ESTOP, FAULT]
+      response:
+        cleared: array
+        remaining: array
+      example:
+        cmd: '{"cmd":"RESET_FAULTS","seq":80}'
+        response: '{"ok":true,"data":{"cleared":["JAM"],"remaining":[]},"seq":80,"ts":40000}'
+
+diagnostics:
+  mode_required: SERVICE
+  
+  DIAG_MOTORS:
+    desc: Test motor functionality
+    args:
+      motor: {type: enum, values: [LEFT, RIGHT, AUGER], required: true}
+      test_type: {type: enum, values: [CONTINUITY, CURRENT, ENCODER], required: true}
+    tests:
+      CONTINUITY: Check motor winding resistance
+      CURRENT: Measure no-load current draw
+      ENCODER: Verify encoder response to rotation
+    response:
+      pass: bool
+      current_a: float
+      encoder_response: bool
+      resistance_ohm: float
+    example:
+      cmd: '{"cmd":"DIAG_MOTORS","args":{"motor":"LEFT","test_type":"CURRENT"},"seq":200}'
+      response: '{"ok":true,"data":{"pass":true,"current_a":0.8,"encoder_response":true},"seq":200,"ts":80000}'
+
+  DIAG_SENSORS:
+    desc: Validate sensor readings
+    args:
+      sensor: {type: enum, values: [IMU, ENCODERS, BATTERY, TEMP], required: true}
+    response:
+      status: enum[OK, DEGRADED, FAILED]
+      raw_value: varies
+      calibrated_value: varies
+    example:
+      cmd: '{"cmd":"DIAG_SENSORS","args":{"sensor":"IMU"},"seq":201}'
+      response: '{"ok":true,"data":{"status":"OK","raw_value":[0.01,-0.02,1.58]},"seq":201,"ts":81000}'
+
+  DIAG_COMMS:
+    desc: Communication quality test
+    args:
+      duration_s: {type: int, range: [5, 60], required: true}
+    procedure:
+      - Send ping packets at 10 Hz
+      - Measure response times
+      - Calculate packet loss and latency
+    response:
+      packets_sent: int
+      packets_received: int
+      packet_loss_pct: float
+      avg_latency_ms: float
+      max_latency_ms: float
+    example:
+      cmd: '{"cmd":"DIAG_COMMS","args":{"duration_s":10},"seq":202}'
+      response: '{"ok":true,"data":{"packets_sent":100,"packets_received":100,"packet_loss_pct":0.0,"avg_latency_ms":8.2},"seq":202,"ts":91000}'
+
+  GET_PARAMS:
+    desc: Read configuration parameters
+    args:
+      param_name: {type: string, required: true, values: [PID_DRIVE_KP, PID_DRIVE_KI, PID_DRIVE_KD, JAM_THRESHOLD, BATT_WARN_V, BATT_CRIT_V]}
+    response:
+      param_name: string
+      value: varies
+      units: string
+    example:
+      cmd: '{"cmd":"GET_PARAMS","args":{"param_name":"PID_DRIVE_KP"},"seq":203}'
+      response: '{"ok":true,"data":{"param_name":"PID_DRIVE_KP","value":1.5,"units":"unitless"},"seq":203,"ts":92000}'
+
+  SET_PARAMS:
+    desc: Write configuration parameters
+    args:
+      param_name: {type: string, required: true}
+      value: {type: varies, required: true}
+    behavior:
+      validation: Range checking performed
+      persistence: Stored in EEPROM
+      effective: Immediate after write
+    errors: [INVALID, LIMIT]
+    response:
+      param_name: string
+      old_value: varies
+      new_value: varies
+    example:
+      cmd: '{"cmd":"SET_PARAMS","args":{"param_name":"PID_DRIVE_KP","value":1.8},"seq":204}'
+      response: '{"ok":true,"data":{"param_name":"PID_DRIVE_KP","old_value":1.5,"new_value":1.8},"seq":204,"ts":93000}'
+
+  CAL_ENCODERS:
+    desc: Zero encoder counters
+    args: {}
+    procedure:
+      - Ensure robot stationary
+      - Reset counters to zero
+      - Verify no drift over 5s
+    response:
+      zeroed: bool
+      drift_ticks: int
+    example:
+      cmd: '{"cmd":"CAL_ENCODERS","seq":205}'
+      response: '{"ok":true,"data":{"zeroed":true,"drift_ticks":0},"seq":205,"ts":94000}'
+
+  CAL_IMU:
+    desc: Calibrate IMU offsets
+    args: {}
+    procedure:
+      - Robot must be level and stationary
+      - Collect 1000 samples over 10s
+      - Calculate bias offsets
+      - Store in EEPROM
+    duration: 10 s
+    response:
+      calibrated: bool
+      gyro_bias: array[3]
+      accel_bias: array[3]
+    example:
+      cmd: '{"cmd":"CAL_IMU","seq":206}'
+      response: '{"ok":true,"data":{"calibrated":true,"gyro_bias":[0.01,-0.02,0.00],"accel_bias":[0.05,0.03,0.12]},"seq":206,"ts":104000}'
+
+telemetry:
+  overview:
+    auto_send: true
+    includes_timestamp: true
+    
+  types:
+    STAT:
+      desc: Periodic robot status
+      rate: 12 Hz
+      auto_enabled: true
+      fields:
+        v: {type: float, units: m/s, desc: Current linear velocity}
+        w: {type: float, units: rad/s, desc: Current angular velocity}
+        enc_l: {type: int, units: ticks, ticks_per_rev: 600, wraparound: 2147483647, desc: Left encoder cumulative}
+        enc_r: {type: int, units: ticks, ticks_per_rev: 600, wraparound: 2147483647, desc: Right encoder cumulative}
+        imu: {type: array[3], units: [rad, rad, rad], range: [-π, π], desc: [roll, pitch, yaw]}
+        temp: {type: float, units: °C, warning: 60.0, critical: 75.0, desc: Motor controller temperature}
+        auger: {type: int, units: rpm, desc: Current auger speed}
+        salt: {type: object, fields: {state: enum[ON,OFF], level_kg: float}}
+        battery_v: {type: float, units: V, nominal: [44.0, 52.0], warning: 42.0, critical: 40.0}
+        mode: {type: enum, values: [DISABLED, MANUAL, AUTO, SERVICE]}
+        estop: {type: bool}
+        faults: {type: array, items: string, desc: Active fault codes}
+      example: '{"type":"STAT","v":0.5,"w":0.0,"enc_l":12453,"enc_r":12490,"imu":[0.0,0.05,1.57],"temp":42.3,"auger":2000,"salt":{"state":"ON","level_kg":8.2},"battery_v":46.4,"mode":"MANUAL","estop":false,"faults":[],"ts":50000}'
+
+    FAULT:
+      desc: Immediate fault notification
+      trigger: on_change
+      fields:
+        code: int
+        name: string
+        severity: string
+        source: string
+        desc: string
+        latched: bool
+      example: '{"type":"FAULT","code":2,"name":"JAM","severity":"fault","source":"AUGER","desc":"Mechanical jam detected","latched":true,"ts":55000}'
+
+    EVENT:
+      desc: State change notifications
+      trigger: on_change
+      fields:
+        event: string
+        data: object
+      events:
+        MODE_CHANGE: {data: {from: string, to: string}}
+        ESTOP_TRIGGER: {data: {active: bool}}
+        ESTOP_CLEAR: {data: {duration_ms: int}}
+        BATTERY_LOW: {data: {voltage: float, threshold: string}}
+        FAULT_CLEARED: {data: {fault_name: string}}
+      example: '{"type":"EVENT","event":"MODE_CHANGE","data":{"from":"DISABLED","to":"MANUAL"},"ts":60000}'
+
+# ============================================================================
+# 6. HARDWARE & PHYSICAL SPECIFICATIONS
+# ============================================================================
+hardware:
+  electronics:
+    controller:
+      model: Arduino Uno R4 WiFi
+      processor: Renesas RA4M1 (ARM Cortex-M4)
+      clock: 48 MHz
+      flash: 256 kB
+      ram: 32 kB
+      
+    compute:
+      model: NVIDIA Jetson Orin Nano Super
+      processor: ARM Cortex-A78AE
+      gpu: NVIDIA Ampere (1024 CUDA cores)
+      ram: 8 GB
+      storage: 64 GB eMMC
+
+  actuators:
+    drive_motors:
+      type: DC brushed with gearbox
+      quantity: 2
+      voltage: 24 V
+      current_max: 12 A per motor
+      current_nominal: 3 A per motor
+      gear_ratio: 50:1
+      encoders:
+        type: Quadrature
+        resolution: 600 ticks/revolution
+        channels: A/B
+        
+    auger_motor:
+      type: DC brushless (BLDC)
+      quantity: 1
+      voltage: 48 V
+      current_max: 30 A
+      current_nominal: 10 A
+      rpm_range: [0, 4000]
+      controller: External ESC
+
+  sensors:
+    imu:
+      model: BNO055
+      type: 9-DOF (accel + gyro + mag)
+      sampling_rate: 100 Hz
+      interface: I2C
+      outputs: [roll, pitch, yaw]
+      
+    encoders:
+      type: Quadrature
+      resolution: 600 ticks/rev
+      interface: Hardware interrupt pins
+      
+    battery_monitor:
+      type: Voltage divider
+      input_range: [40, 52] V
+      adc_resolution: 10-bit
+      precision: 0.1 V
+      
+    temperature:
+      type: Thermistor
+      location: Motor driver heat sink
+      range: [-20, 85] °C
+      
+    salt_level:
+      type: Current sensing
+      method: Motor load detection
+      threshold: Hopper empty when current drops
+
+physical:
+  dimensions:
+    length: 1.2 m
+    width: 0.8 m
+    height: 0.6 m
+    wheelbase: 0.588625 m
+    track_width: 0.65 m
+    wheel_diameter: 0.25 m
+    wheel_radius: 0.127 m
+    ground_clearance: 0.1 m
+    
+  mass:
+    robot_empty: 120 kg
+    salt_capacity: 10 kg
+    robot_loaded: 130 kg
+    battery: 15 kg
+    
+  motion_capabilities:
+    max_speed_forward: 1.35 m/s (4.86 km/h)
+    max_speed_reverse: 1.35 m/s
+    max_angular_rate: 3.0 rad/s (172°/s)
+    max_acceleration: 2.0 m/s²
+    max_deceleration: 3.0 m/s²
+    turning_radius_min: 0.325 m (zero turn capable)
+    
+  kinematics:
+    model: Differential drive
+    wheel_radius: 0.127 m
+    track_width: 0.65 m
+    gear_ratio: 50:1
+    
+    forward_kinematics:
+      description: Convert wheel velocities to robot velocity
+      equations:
+        v: (v_left + v_right) / 2
+        ω: (v_right - v_left) / track_width
+        
+    inverse_kinematics:
+      description: Convert robot velocity to wheel velocities
+      equations:
+        v_left: v - (ω × track_width / 2)
+        v_right: v + (ω × track_width / 2)
+        
+  power:
+    battery:
+      type: Lithium-ion
+      voltage_nominal: 48 V
+      capacity: 20 Ah
+      energy: 960 Wh
+      cells: 13S configuration
+      voltage_range: [40, 52] V
+      charge_current: 5 A
+      discharge_current_max: 50 A
+      
+    power_consumption:
+      idle: 50 W
+      driving: 200-400 W
+      auger: 300-500 W
+      peak: 1000 W
+      
+    runtime_estimates:
+      idle: 19 hours
+      light_work: 3-4 hours
+      heavy_work: 1-2 hours
+
+environment:
+  operating_conditions:
+    temperature: [-20, 50] °C
+    humidity: [0, 95]% non-condensing
+    ingress_protection: IP54 (dust/splash resistant)
+    altitude: [0, 2000] m
+    
+  storage_conditions:
+    temperature: [-30, 70] °C
+    humidity: [0, 95]% non-condensing
+    
+  environmental_notes:
+    - Battery performance degrades below -10°C
+    - IMU accuracy affected by magnetic interference
+    - Motors derated above 40°C ambient
+    - Salt should be kept dry to prevent clumping
+    - Regular cleaning required for reliable operation
+
+calibration:
+  encoder_zero:
+    command: CAL_ENCODERS
+    frequency: On startup or on demand
+    procedure:
+      - Ensure robot is stationary
+      - Reset encoder counters to zero
+      - Verify no drift over 5 seconds
+    storage: Volatile (RAM only)
+    
+  imu_calibration:
+    command: CAL_IMU
+    frequency: First boot or after reset
+    duration: 10 seconds
+    procedure:
+      - Robot must be level and stationary
+      - Collect 1000 samples
+      - Calculate bias offsets for gyro and accel
+      - Store calibration in EEPROM
+    storage: Non-volatile (EEPROM)
+    valid_until: Next power cycle or 24 hours
+    
+  battery_calibration:
+    voltage_divider_ratio: 13.0
+    adc_reference: 5.0 V
+    calibration_points:
+      - [ADC: 0, Voltage: 0.0 V]
+      - [ADC: 1023, Voltage: 52.0 V]
+    equation: V_battery = (ADC / 1023) × 52.0
+    
+  motor_pid_tuning:
+    drive_left:
+      kp: 1.5
+      ki: 0.3
+      kd: 0.05
+      output_limit: [-255, 255]
+      
+    drive_right:
+      kp: 1.5
+      ki: 0.3
+      kd: 0.05
+      output_limit: [-255, 255]
+      
+    auger:
+      kp: 2.0
+      ki: 0.1
+      kd: 0.0
+      output_limit: [0, 4000]
+
+# ============================================================================
+# 7. IMPLEMENTATION GUIDE
+# ============================================================================
+implementation:
+  overview:
+    architecture: Dual-processor system
+    primary_compute: Jetson (high-level control, navigation, perception)
+    safety_controller: Arduino (low-level control, safety enforcement)
+    communication: Serial UART at 115200 baud
+    
+  arduino_firmware:
+    language: C++
+    framework: Arduino
+    target: Arduino Uno R4 WiFi
+    
+    critical_tasks:
+      - [ ] Implement JSON parser with 5ms budget
+      - [ ] Set up serial communication (115200 baud)
+      - [ ] Implement watchdog timer for DRIVE commands
+      - [ ] Create state machine with all 6 states
+      - [ ] Implement motor control with PID
+      - [ ] Set up encoder reading with interrupts
+      - [ ] Implement current sensing for jam detection
+      - [ ] Create EEPROM storage for calibration
+      - [ ] Implement all command handlers
+      - [ ] Set up periodic telemetry (12 Hz STAT)
+      - [ ] Implement E-stop hardware interrupt
+      - [ ] Add temperature monitoring
+      
+    recommended_libraries:
+      json_parser: ArduinoJson (version 6.x)
+      pid_control: Arduino PID Library
+      encoder: Encoder library (Paul Stoffregen)
+      
+    memory_considerations:
+      - Use streaming JSON parser to minimize RAM
+      - Pre-allocate buffers for messages
+      - Target <24kB RAM usage
+      - Reserve 4kB for stack
+      
+    timing_constraints:
+      main_loop: 10 ms (100 Hz)
+      command_processing: <5 ms
+      response_generation: <2 ms
+      telemetry_generation: 83 ms (12 Hz)
+      watchdog_check: Every loop iteration
+      imu_read: 10 ms (100 Hz)
+      
+    testing_tasks:
+      - [ ] Unit test each command handler
+      - [ ] Test state transitions
+      - [ ] Verify E-stop behavior
+      - [ ] Test watchdog timeout
+      - [ ] Verify current limits and shutdown
+      - [ ] Test all error recovery procedures
+      - [ ] Measure timing constraints
+      - [ ] Test serial buffer overflow handling
+      - [ ] Validate JSON parsing edge cases
+      - [ ] Test encoder overflow/wraparound
+      
+  jetson_software:
+    language: Python 3.8+
+    framework: ROS 2 (optional) or standalone
+    target: Jetson Orin Nano Super
+    
+    critical_tasks:
+      - [ ] Implement command generator with seq tracking
+      - [ ] Set up serial port with 100ms timeout
+      - [ ] Implement response parser with error handling
+      - [ ] Create telemetry subscriber and callbacks
+      - [ ] Implement startup sequence
+      - [ ] Create health monitoring (latency, packet loss)
+      - [ ] Implement data logging (CSV or rosbag)
+      - [ ] Add fault recovery logic
+      - [ ] Implement degraded mode handling
+      - [ ] Add command queuing and rate limiting
+      
+    recommended_libraries:
+      serial: pyserial
+      json: Built-in json module
+      logging: Python logging or ROS 2
+      
+    architecture_pattern: Producer-consumer with threads
+      - Serial TX thread: Send commands at controlled rate
+      - Serial RX thread: Receive and parse responses/telemetry
+      - Main thread: Application logic and decision making
+      
+    testing_tasks:
+      - [ ] Test all commands end-to-end
+      - [ ] Verify sequence number handling
+      - [ ] Test communication reliability
+      - [ ] Measure round-trip latency
+      - [ ] Test reconnection logic
+      - [ ] Verify logging functionality
+      - [ ] Integration test all test scenarios
+      - [ ] Test error handling and recovery
+      - [ ] Validate watchdog compliance
+      - [ ] Test degraded mode transitions
+
+performance:
+  latency:
+    command_processing_arduino: <5 ms
+    response_generation_arduino: <2 ms
+    serial_transmission_256b: ~2.2 ms at 115200 baud
+    total_round_trip_typical: <10 ms
+    total_round_trip_max: <50 ms
+    
+  throughput:
+    commands_per_second_max: 25
+    telemetry_stat_per_second: 12
+    telemetry_event_per_second: Variable (on change)
+    bytes_per_second_typical: ~3000
+    bytes_per_second_peak: ~6000
+    
+  timing_constraints:
+    drive_command_loop: 40 ms (25 Hz)
+    stat_telemetry_loop: 83 ms (12 Hz)
+    watchdog_check: 10 ms
+    imu_sampling: 10 ms (100 Hz)
+    temperature_check: 1000 ms (1 Hz)
+    
+  resource_usage:
+    arduino_ram_typical: 18 kB / 32 kB
+    arduino_ram_peak: 24 kB / 32 kB
+    arduino_flash: 180 kB / 256 kB
+    arduino_cpu_idle: 40%
+    arduino_cpu_active: 75%
+    
+    jetson_ram: <100 MB
+    jetson_cpu: <10% single core
+    jetson_storage: <1 GB
+
+logging:
+  arduino:
+    enabled: false
+    reason: Insufficient storage
+    debug_output: Serial (115200 baud on separate port if available)
+    
+  jetson:
+    required: true
+    
+    continuous_logging:
+      - All STAT telemetry
+      - All commands sent
+      - All responses received
+      - Sequence numbers
+      - Timestamps
+      - Latency metrics
+      
+    event_logging:
+      - FAULT occurrences with context
+      - E-stop triggers with 5s pre-buffer
+      - MODE changes
+      - Startup sequence
+      - Connection loss/recovery
+      - Watchdog timeouts
+      
+    format_options:
+      csv: Simple, human-readable, lower overhead
+      rosbag: ROS ecosystem compatible, better tooling
+      json_lines: Structured, parseable, moderate overhead
+      
+    rotation:
+      size: 100 MB per file
+      time: 1 hour per file
+      retention: 7 days
+      
+    blackbox:
+      pre_fault_buffer: 5 seconds
+      post_fault_buffer: 2 seconds
+      includes:
+        - Motion commands (DRIVE)
+        - Sensor readings (STAT)
+        - Battery voltage
+        - Temperature
+        - Error states
+
+failover:
+  connection_loss:
+    detection: No response within ack_timeout_ms (250ms)
+    arduino_action: Enter TIMEOUT state, execute STOP
+    jetson_action: Log error, attempt reconnection
+    recovery: Resume on next valid command
+    
+  jetson_crash:
+    detection: No command for 2 seconds
+    arduino_action: Transition to DISABLED mode, STOP all motion
+    recovery: Requires full initialization sequence (HELLO → MODE)
+    
+  arduino_reset:
+    detection: Unexpected HELLO or version mismatch
+    jetson_action: Log event, restart initialization
+    reconnect_attempts: 3
+    reconnect_delay: 1000 ms
+    
+  degraded_mode:
+    trigger: Repeated timeouts (>5 in 10 seconds)
+    behavior: Reduce max speeds by 50%
+    telemetry: Send high-frequency ERROR notifications
+    recovery: Automatic after 30s of stable communication
+
+initialization:
+  power_on_sequence:
+    arduino:
+      - Hardware reset
+      - Load bootloader
+      - Start firmware (~1s)
+      - Initialize peripherals
+      - Load EEPROM calibration
+      - Enter BOOT state
+      - Run self-test
+      - Transition to DISABLED
+      - Ready for HELLO
+      
+    jetson:
+      - Boot operating system (~30s)
+      - Load application
+      - Open serial port
+      - Wait for Arduino ready
+      - Send HELLO
+      - Verify compatibility
+      - Initialize state
+      - Enter operational mode
+      
+  required_startup_sequence:
+    - step: 1
+      command: HELLO
+      purpose: Handshake and version check
+      expected: compatible=true
+      
+    - step: 2
+      command: MODE:DISABLED
+      purpose: Confirm safe state
+      expected: ok=true
+      
+    - step: 3
+      command: RESET_FAULTS (if needed)
+      purpose: Clear any boot faults
+      expected: ok=true
+      
+    - step: 4
+      command: MODE:MANUAL or MODE:AUTO
+      purpose: Enable motion
+      expected: ok=true
+      
+    - step: 5
+      command: DRIVE or other motion commands
+      purpose: Begin operation
+      expected: ok=true
+
+usage_examples:
+  basic_operation:
+    description: Start robot and drive forward
+    sequence:
+      - {cmd: '{"cmd":"HELLO","args":{"client_version":"0.2.0"},"seq":1}', expect: '{"ok":true,"data":{"compatible":true},...}'}
+      - {cmd: '{"cmd":"MODE","args":{"mode":"MANUAL"},"seq":2}', expect: '{"ok":true,...}'}
+      - {cmd: '{"cmd":"DRIVE","args":{"v":0.5,"w":0.0},"seq":3}', expect: '{"ok":true,...}'}
+      - {action: Continue sending DRIVE at 25Hz, note: Maintain watchdog}
+      - {cmd: '{"cmd":"STOP","seq":50}', expect: '{"ok":true,...}'}
+      
+  salt_dispensing:
+    description: Start auger and dispense salt while driving
+    prerequisites: Robot in MANUAL mode
+    sequence:
+      - {cmd: '{"cmd":"AUGER","args":{"rpm":2000},"seq":100}', expect: '{"ok":true,...}'}
+      - {wait: 2s, reason: Allow auger to reach speed}
+      - {cmd: '{"cmd":"SALT","args":{"state":"ON"},"seq":101}', expect: '{"ok":true,...}'}
+      - {cmd: '{"cmd":"DRIVE","args":{"v":0.5,"w":0.0},"seq":102}', expect: '{"ok":true,...}', note: Continue at 25Hz}
+      - {action: Drive pattern for salt coverage}
+      - {cmd: '{"cmd":"SALT","args":{"state":"OFF"},"seq":150}', expect: '{"ok":true,...}'}
+      - {cmd: '{"cmd":"AUGER","args":{"rpm":0},"seq":151}', expect: '{"ok":true,...}'}
+      - {cmd: '{"cmd":"STOP","seq":152}', expect: '{"ok":true,...}'}
+      
+  fault_recovery:
+    description: Handle and clear a jam fault
+    sequence:
+      - {observe: FAULT telemetry received, data: '{"type":"FAULT","code":2,"name":"JAM",...}'}
+      - {cmd: '{"cmd":"STOP","seq":200}', expect: '{"ok":true,...}'}
+      - {action: Inspect and clear physical obstruction}
+      - {cmd: '{"cmd":"RESET_FAULTS","seq":201}', expect: '{"ok":true,"data":{"cleared":["JAM"],...}}'}
+      - {verify: No faults remain in STAT telemetry}
+      - {cmd: '{"cmd":"DRIVE","args":{"v":0.2,"w":0.0},"seq":202}', expect: '{"ok":true,...}', note: Resume slowly}
+      
+  emergency_stop:
+    description: Handle emergency stop event
+    sequence:
+      - {state: Robot driving forward}
+      - {action: Physical E-stop button pressed}
+      - {observe: Robot stops immediately, ESTOP telemetry sent}
+      - {cmd: '{"cmd":"DRIVE","args":{"v":0.5,"w":0.0},"seq":300}', expect: '{"ok":false,"error":"ESTOP",...}'}
+      - {action: Clear hazard}
+      - {action: Release E-stop button physically}
+      - {observe: Robot transitions to DISABLED mode}
+      - {cmd: '{"cmd":"MODE","args":{"mode":"MANUAL"},"seq":301}', expect: '{"ok":true,...}'}
+      - {cmd: '{"cmd":"DRIVE","args":{"v":0.5,"w":0.0},"seq":302}', expect: '{"ok":true,...}'}
+
+test_scenarios:
+  - name: Normal startup sequence
+    objective: Verify proper initialization
+    steps:
+      - Send HELLO with client version
+      - Verify compatible=true in response
+      - Send MODE:DISABLED
+      - Send RESET_FAULTS (if faults present)
+      - Send MODE:MANUAL
+      - Send DRIVE command
+      - Verify robot motion
+      
+  - name: Emergency stop during motion
+    objective: Verify E-stop safety function
+    steps:
+      - Set MODE:MANUAL
+      - Send DRIVE v=1.0, w=0.0
+      - Trigger physical E-stop
+      - Verify motion stops within 200ms
+      - Verify DRIVE commands return error=ESTOP
+      - Release E-stop button
+      - Verify E-stop clears automatically
+      - Verify DRIVE commands accepted
+      
+  - name: Watchdog timeout
+    objective: Verify communication loss handling
+    steps:
+      - Set MODE:MANUAL
+      - Send DRIVE v=1.0, w=0.0
+      - Wait 600ms without sending DRIVE
+      - Verify robot executes STOP
+      - Verify FAULT:TIMEOUT in telemetry
+      - Send DRIVE v=0.5, w=0.0
+      - Verify fault clears automatically
+      - Verify motion resumes
+      
+  - name: Command rate limiting
+    objective: Verify rate limiter enforcement
+    steps:
+      - Send 50 DRIVE commands in 1 second
+      - Verify max 25 commands processed
+      - Verify no errors returned
+      - Verify robot behavior stable
+      
+  - name: Auger jam detection
+    objective: Verify jam detection and recovery
+    steps:
+      - Send AUGER:2000
+      - Simulate mechanical jam (increase load)
+      - Verify FAULT:JAM within 500ms
+      - Verify auger stopped automatically
+      - Send RESET_FAULTS
+      - Verify error=FAULT (jam still present)
+      - Clear jam physically
+      - Send RESET_FAULTS
+      - Verify ok=true, jam cleared
+      
+  - name: Battery low protection
+    objective: Verify battery monitoring and protection
+    steps:
+      - Discharge battery to 42V
+      - Verify warning in STAT.battery_v
+      - Continue discharge to 39V
+      - Verify FAULT:LOW_BATTERY
+      - Verify motion disabled
+      - Send DRIVE command
+      - Verify error=FAULT
+      - Charge battery above 44V
+      - Send RESET_FAULTS
+      - Verify fault cleared
+      
+  - name: State transition validation
+    objective: Verify all valid state transitions
+    steps:
+      - From DISABLED, transition to MANUAL (valid)
+      - From MANUAL, transition to AUTO (valid)
+      - From AUTO, transition to DISABLED (valid)
+      - From DISABLED, attempt transition to AUTO (invalid)
+      - Verify error returned
+      - From DISABLED, transition to SERVICE (valid, if no faults)
+      - From SERVICE, transition to DISABLED (valid)
+      
+  - name: Sequence number tracking
+    objective: Verify sequence number echo and lost command detection
+    steps:
+      - Send command with seq=100
+      - Verify response has seq=100
+      - Send command with seq=101
+      - Verify response has seq=101
+      - Skip seq=102, send seq=103
+      - Verify response still has correct seq
+      - Log any mismatches for debugging
+
+# ============================================================================
+# 8. COMPLIANCE & SAFETY
+# ============================================================================
+safety_compliance:
+  standards_reference:
+    - ISO 13849-1: Safety of machinery - Safety-related parts of control systems
+    - IEC 61508: Functional safety of electrical/electronic/programmable electronic safety-related systems
+    - ISO 12100: Safety of machinery - General principles for design
+    
+  safety_integrity_level:
+    target: SIL 1 (Safety Integrity Level 1)
+    justification: Low-speed snow removal robot, operator supervised, low consequence of failure
+    
+  safety_functions:
+    emergency_stop:
+      category: Category 0 (uncontrolled stop)
+      performance_level: PLc
+      hardware: Physical E-stop button with mechanical latch
+      redundancy: Hardware override, software monitoring
+      response_time: <200 ms
+      test_frequency: Before each use
+      
+    watchdog_timer:
+      purpose: Detect communication loss between Jetson and Arduino
+      timeout: 500 ms
+      action: Controlled stop (200ms ramp)
+      category: Degraded operation
+      
+    overcurrent_protection:
+      purpose: Prevent motor damage and fire hazard
+      response_time: <50 ms
+      action: Immediate motor disable
+      hardware: Current sensors on all motor circuits
+      
+  risk_assessment:
+    hazards_identified:
+      - Unintended motion (severity: medium, probability: low)
+      - Crushing/pinching (severity: high, probability: very low)
+      - Electrical fire from fault (severity: high, probability: very low)
+      - Loss of control (severity: medium, probability: low)
+      - Slip/fall on treated surface (severity: low, probability: medium)
+      
+    mitigation_measures:
+      - E-stop button accessible at all times
+      - Maximum speed limited to 1.35 m/s
+      - Current limiting on all motors
+      - Watchdog timer for communication loss
+      - Visual indicators (lights) for status
+      - Emergency contact procedure
+      - Operator training required
+      
+  operator_training_required:
+    - E-stop operation and reset procedure
+    - Normal startup sequence
+    - Fault recognition and recovery
+    - Safe operating area and conditions
+    - Battery charging and handling procedures
+    - Maintenance schedules
+    - Emergency procedures
+
+troubleshooting:
+  - symptom: Commands timeout frequently
+    severity: High
+    possible_causes:
+      - Serial buffer overflow (messages too large)
+      - Baud rate mismatch
+      - JSON parsing taking >5ms
+      - Cable connection intermittent
+    solutions:
+      - Reduce message size (remove optional fields)
+      - Verify baud rate on both Jetson and Arduino
+      - Optimize JSON parsing (use streaming parser)
+      - Check serial cable connections
+      - Add checksums to detect corruption
+    diagnosis:
+      - Monitor round-trip latency
+      - Check for parse errors in logs
+      - Verify serial port settings
+      
+  - symptom: Robot drifts during straight line motion
+    severity: Medium
+    possible_causes:
+      - Encoder miscalibration
+      - Wheel diameter mismatch
+      - PID tuning inadequate
+      - Mechanical binding on one side
+      - Uneven terrain
+    solutions:
+      - Run CAL_ENCODERS command
+      - Verify physical wheel diameters match
+      - Tune drive PID gains
+      - Inspect mechanical assembly for binding
+      - Test on level surface
+    diagnosis:
+      - Monitor encoder counts in STAT telemetry
+      - Compare left vs right encoder rates
+      - Check for consistent drift direction
+      
+  - symptom: False JAM detections
+    severity: Medium
+    possible_causes:
+      - Current threshold too low
+      - Transient inrush current at startup
+      - Mechanical binding intermittent
+      - Current sensor noise
+    solutions:
+      - Increase jam_threshold_a parameter
+      - Add current measurement filtering
+      - Increase jam_duration_ms to debounce
+      - Inspect mechanical assembly
+      - Add soft-start ramp
+    diagnosis:
+      - Log current measurements during operation
+      - Check for pattern in jam occurrences
+      - Test with different loads
+      
+  - symptom: Telemetry rate inconsistent
+    severity: Low
+    possible_causes:
+      - Arduino main loop blocking
+      - Serial buffer full
+      - Timing jitter from interrupts
+    solutions:
+      - Profile Arduino main loop timing
+      - Reduce telemetry message size
+      - Optimize interrupt handlers
+      - Increase serial buffer size
+    diagnosis:
+      - Measure actual telemetry rate on Jetson
+      - Check for timing violations in Arduino logs
+      - Monitor serial buffer usage
+      
+  - symptom: Battery voltage reading unstable
+    severity: Low
+    possible_causes:
+      - ADC noise
+      - Voltage divider component tolerance
+      - No filtering on ADC input
+      - High current draw causing voltage sag
+    solutions:
+      - Add capacitor to ADC input
+      - Implement moving average filter
+      - Calibrate voltage divider ratio
+      - Account for load-dependent voltage sag
+    diagnosis:
+      - Monitor raw ADC values
+      - Compare with external voltmeter
+      - Check during different load conditions
+
+# ============================================================================
+# VERSION HISTORY & MIGRATION
+# ============================================================================
+version_history:
+  v0.1.1:
+    date: 2025-12-19
+    description: Initial protocol definition
+    changes:
+      - Basic message format (JSON over serial)
+      - Core motion commands (DRIVE, STOP, MODE)
+      - Simple error handling
+      - Periodic telemetry (STAT)
+    breaking_changes: []
+    
+  v0.2.0:
+    date: 2026-01-06
+    description: Major update with enhanced safety and diagnostics
+    changes:
+      - Added sequence numbers to all commands and responses
+      - Explicit watchdog specification and implementation
+      - Updated voltage/current thresholds for 48V system
+      - Added EVENT telemetry type for state changes
+      - Comprehensive 6-state machine definition
+      - Added diagnostic commands (SERVICE mode)
+      - Detailed error recovery procedures
+      - Added BLINK option to LIGHT command
+      - Structured calibration procedures
+      - Performance metrics and resource usage documented
+    breaking_changes:
+      - Battery thresholds changed (12V → 48V system)
+      - All commands now require 'seq' field
+      - All responses now include 'seq' and 'ts' fields
+      - AUGER command changed from {state, rpm} to {rpm} only
+      - SALT command changed from {state, rate} to {state} only
+    migration_guide:
+      arduino:
+        - Update battery monitoring thresholds (40V/42V)
+        - Implement sequence number echo in responses
+        - Add timestamp to all responses
+        - Update AUGER handler (rpm=0 means OFF)
+        - Update SALT handler (remove rate parameter)
+        - Implement watchdog timer for DRIVE commands
+      jetson:
+        - Add sequence number tracking to command generator
+        - Update response parser to extract 'seq' and 'ts'
+        - Update AUGER command syntax (no state field)
+        - Update SALT command syntax (no rate field)
+        - Update battery threshold monitoring
+        - Implement watchdog compliance (25 Hz DRIVE)
+
+  v0.3.0:
+    date: 2026-01-10
+    description: Major update with changed command formats.
+    changes:
+      - Added system health telemetry
+    breaking_changes:
+      - DRIVE command changed to SET_VELOCITY
+      - Switched to event-based system
+      - Two-tier watchdog system
+      - Added COMM_DEGRADED state
+
+# ============================================================================
+# ADDITIONAL NOTES
+# ============================================================================
+notes:
+  - All floating point values use 2-decimal precision for consistency
+  - Arduino uses single-precision float (32-bit IEEE 754)
+  - Message parsing budget: 5ms max per message on Arduino
+  - Serial buffer overflow discards oldest data (FIFO)
+  - Timestamps wraparound after ~49.7 days (uint32_t milliseconds)
+  - IMU data filtered with complementary filter on Arduino
+  - Encoder values are cumulative since power-on (not velocity)
+  - Temperature monitoring every 1s, automatic shutdown at 80°C
+  - E-stop is fail-safe: power loss = motors disabled
+  - All state transitions logged in EVENT telemetry
+  - Protocol is version-negotiated during HELLO handshake
+
+future_enhancements:
+  v0.X.0_candidates:
+    - CRC/checksum for message integrity
+    - Binary protocol option for efficiency
+    - Multi-priority command queues
+    - Autonomous mode waypoint navigation
+    - GPS integration for position tracking
+    - Web interface for monitoring
+    - Remote control via WiFi
+    - Data analytics and performance trends
+    - Predictive maintenance alerts
